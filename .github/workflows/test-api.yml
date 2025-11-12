@@ -1,10 +1,14 @@
 name: Automated API tests using Postman CLI
 
-on: push
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   automated-api-tests:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -17,20 +21,57 @@ jobs:
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
       - name: Start FastAPI in background
         run: |
           uvicorn main:app --host 0.0.0.0 --port 8000 > server.log 2>&1 &
+          echo $! > fastapi.pid
 
-      - uses: actions/checkout@v4
+      - name: Wait for FastAPI to be ready
+        run: |
+          for i in {1..30}; do
+            if curl -sSf http://localhost:8000/healthz >/dev/null; then
+              echo "FastAPI is ready"; exit 0;
+            fi
+            sleep 2
+          done
+          echo "FastAPI did not become ready in time"; cat server.log || true; exit 1
+
       - name: Install Postman CLI
         run: |
           curl -o- "https://dl-cli.pstmn.io/install/linux64.sh" | sh
+
       - name: Login to Postman CLI
-        run: postman login --with-api-key ${{ secrets.POSTMAN_API_KEY }}
-      - name: Run API tests
+        env:
+          POSTMAN_API_KEY: ${{ secrets.POSTMAN_API_KEY }}
+        run: postman login --with-api-key "$POSTMAN_API_KEY"
+
+      - name: Run Postman collection
         run: |
-          postman collection run "43350414-74db3c4b-cb77-4058-8f77-78d6c387c8b2" --integration-id "182744-${{ github.run_id }}"
-          # Lint your API using Postman CLI
-          postman api lint 0dd2ef1b-6752-4488-853c-01ba9018eaaa --integration-id 182744
+          # Reemplaza el UID por el de tu colección
+          postman collection run "43350414-74db3c4b-cb77-4058-8f77-78d6c387c8b2" \
+            --integration-id "182744-${{ github.run_id }}" \
+            --env-var baseUrl=http://localhost:8000 \
+            --reporters cli,junit,json \
+            --reporter-junit-export newman/newman-junit.xml \
+            --reporter-json-export newman/newman-report.json
+
+      - name: Lint OpenAPI with Postman
+        run: |
+          # Reemplaza el UID por el de tu API (spec) en Postman
+          postman api lint "0dd2ef1b-6752-4488-853c-01ba9018eaaa" --integration-id "182744-${{ github.run_id }}"
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: postman-cli-reports
+          path: |
+            newman/*
+            server.log
+
+      - name: Stop FastAPI
+        if: always()
+        run: |
+          if [ -f fastapi.pid ]; then kill -9 "$(cat fastapi.pid)" || true; fi
